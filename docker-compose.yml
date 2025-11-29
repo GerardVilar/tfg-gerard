@@ -1,84 +1,83 @@
 services:
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.1
+    image: confluentinc/cp-zookeeper:7.3.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
 
   kafka:
-    image: confluentinc/cp-kafka:7.6.1
+    image: confluentinc/cp-kafka:7.3.0
     depends_on:
       - zookeeper
     ports:
-      - "29092:29092"   # puerto para tu host Windows
+      - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-
-      # Un listener interno (containers) y otro para el host
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-
-      # payloads más grandes (útil cuando envíes pesos reales)
-      KAFKA_MESSAGE_MAX_BYTES: 20000000
-      KAFKA_REPLICA_FETCH_MAX_BYTES: 20000000
 
   server:
-    image: python:3.11-slim
-    working_dir: /app
-    command: bash -lc "pip install confluent-kafka numpy && python -m server.server"
-    volumes:
-      - ./:/app
-    environment:
-      PYTHONPATH: /app
-      KAFKA_BROKER: kafka:9092
-      TOPIC_UPDATES: fl.model.updates
-      TOPIC_GLOBAL: fl.model.global
-      AGENTS_EXPECTED: "a0,a1"
-      ROUND_TIMEOUT_SEC: "15"
+    build:
+      context: ./server
     depends_on:
       - kafka
-    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      AGENTS: "benign_1,benign_2,malicious_1"
+      NUM_ROUNDS: "10"
+      MODEL_DIM: "4"
+    volumes:
+      - ./shared:/app/shared
 
-  agent_a0:
-    image: python:3.11-slim
-    working_dir: /app
-    command: bash -lc "pip install confluent-kafka numpy && python -m agents.agents"
-    volumes:
-      - ./:/app
-    environment:
-      PYTHONPATH: /app
-      KAFKA_BROKER: kafka:9092
-      TOPIC_UPDATES: fl.model.updates
-      TOPIC_GLOBAL: fl.model.global
-      AGENT_ID: a0
-      MODE: MOCK
-      EPOCHS: "1"
+  honeypot:
+    build:
+      context: ./honeypot
     depends_on:
       - kafka
-      - server
-    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      HP_ALPHA: "0.33"
+      HP_BETA: "0.67"
+    volumes:
+      - ./shared:/app/shared
 
-  agent_a1:
-    image: python:3.11-slim
-    working_dir: /app
-    command: bash -lc "pip install confluent-kafka numpy && python -m agents.agents"
-    volumes:
-      - ./:/app
-    environment:
-      PYTHONPATH: /app
-      KAFKA_BROKER: kafka:9092
-      TOPIC_UPDATES: fl.model.updates
-      TOPIC_GLOBAL: fl.model.global
-      AGENT_ID: a1
-      MODE: MOCK
-      EPOCHS: "1"
+  agent_benign_1:
+    build:
+      context: ./agents
     depends_on:
       - kafka
-      - server
-    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      AGENT_ID: "benign_1"
+    command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
+    volumes:
+      - ./shared:/app/shared
+
+  agent_benign_2:
+    build:
+      context: ./agents
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      AGENT_ID: "benign_2"
+    command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
+    volumes:
+      - ./shared:/app/shared
+
+  agent_malicious:
+    build:
+      context: ./agents
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      AGENT_ID: "malicious_1"
+    command: ["./wait-for-kafka.sh", "python", "malicious_agent.py"]
+    volumes:
+      - ./shared:/app/shared
