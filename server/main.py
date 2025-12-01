@@ -5,15 +5,42 @@ import time
 import numpy as np
 
 from kafka import KafkaProducer, KafkaConsumer
+from kafka.errors import NoBrokersAvailable
 from shared.model_utils import (
     init_model,
     average_models,
 )
+from PIL import Image
+from tensorflow.keras.datasets import cifar10
+
+IMG_H, IMG_W, IMG_C = 32, 32, 3
+IMG_SIZE = IMG_H * IMG_W * IMG_C
+
+(_x_train, _y_train), _ = cifar10.load_data()
 
 def preview(v):
     return f"{v[:3]} ... ({len(v)} valores)"
 
-def classify_by_distance(agent_models, factor=2.0):
+def get_random_cifar_vector():
+    idx = np.random.randint(0, len(_x_train))
+    img = _x_train[idx].astype("float32")
+    return img.flatten().tolist()
+
+#Image saving converting to PNG
+def save_vector_as_image(vec, filename):
+    if not isinstance(vec, (list, tuple)) or len(vec) != IMG_SIZE:
+        print(f"[SERVER] [WARN] No se puede guardar {filename}: tamaño {len(vec)} != {IMG_SIZE}")
+        return
+
+    arr = np.array(vec, dtype=np.float32)
+    arr = np.clip(arr, 0.0, 255.0).reshape(IMG_H, IMG_W, IMG_C).astype(np.uint8)
+    img = Image.fromarray(arr)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    img.save(filename)
+    print(f"[SERVER] Imagen guardada en {filename}")
+
+
+def classify_by_distance(agent_models, factor=1.2):
     ids = list(agent_models.keys())
     vecs = {aid: np.array(agent_models[aid], dtype=float) for aid in ids}
 
@@ -46,10 +73,23 @@ def classify_by_distance(agent_models, factor=2.0):
 
     return benign, malicious
 
-def create_producer(bootstrap_servers: str):
-    return KafkaProducer(
-        bootstrap_servers=bootstrap_servers,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+def create_producer(bootstrap_servers: str, max_retries: int = 10, delay: float = 3.0):
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[SERVER] Creating KafkaProducer (attempt {attempt}/{max_retries})...")
+            producer = KafkaProducer(
+                bootstrap_servers=bootstrap_servers,
+                api_version=(0, 10, 2),
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            )
+            print("[SERVER] KafkaProducer created successfully.")
+            return producer
+        except NoBrokersAvailable:
+            print(f"[SERVER] No brokers available yet, retrying in {delay}s...")
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"[SERVER] Could not connect to Kafka after {max_retries} attempts."
     )
 
 
@@ -57,6 +97,7 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
     return KafkaConsumer(
         topic,
         bootstrap_servers=bootstrap_servers,
+        api_version=(0, 10, 2),
         group_id=group_id,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         auto_offset_reset="earliest",
@@ -66,12 +107,13 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
 
 def main():
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-    agents_env = os.environ.get("AGENTS", "benign_1,benign_2,malicious_1")
+    agents_env = os.environ.get("AGENTS","benign_1,benign_2,benign_3,benign_4,malicious_1")
     agents = [a.strip() for a in agents_env.split(",") if a.strip()]
 
     num_rounds = int(os.environ.get("NUM_ROUNDS", "10"))
     model_dim = int(os.environ.get("MODEL_DIM", "4"))
 
+    print(f"[SERVER] Using bootstrap servers: {bootstrap}")
     print(f"[SERVER] Starting with agents: {agents}")
     print(f"[SERVER] Rounds: {num_rounds}, model dim: {model_dim}")
 
@@ -84,7 +126,8 @@ def main():
     )
 
     # Reference model on the system
-    global_real_model = init_model(model_dim)
+    global_real_model = get_random_cifar_vector()
+    print("[SERVER] Global model initialized.")
 
     # State by agent
     per_agent_model = {a: list(global_real_model) for a in agents}
@@ -131,7 +174,7 @@ def main():
             print(f"[SERVER] <- Recibido modelo de {agent_id}")
 
         # 3) Detect of malicious agents
-        benign, malicious = classify_by_distance(received_models, factor=2.0)
+        benign, malicious = classify_by_distance(received_models, factor=1.2)
         
         print(f"[SERVER] Agentes benignos: {benign}")
         print(f"[SERVER] Agentes maliciosos: {malicious}")
@@ -139,7 +182,13 @@ def main():
         # 4) Calculate real model
         if benign:
             benign_models = [received_models[a] for a in benign]
-            global_real_model = average_models(benign_models)
+            benign_avg = average_models(benign_models)
+
+            alpha = 0.3
+            global_real_model = [
+                (1 - alpha) * old + alpha * new
+                for old, new in zip(global_real_model, benign_avg)
+            ]
         else:
             # Extreme case: Every agent is malicious
             print("[SERVER] Every agent is malicious, using every agent value...")
@@ -148,6 +197,28 @@ def main():
             )
 
         print(f"[SERVER] New REAL model: {preview(global_real_model)}")
+
+        # Save images
+        images_dir = "/app/shared/images"
+
+        # 4.1) Real model aggregated
+        save_vector_as_image(
+            global_real_model,
+            os.path.join(images_dir, "real", "/app/shared/images/initial_image.png"),
+        )
+
+        # 4.2) Models received per agent
+        for a in benign:
+            save_vector_as_image(
+                received_models[a],
+                os.path.join(images_dir, "benign", a, f"round_{current_round}.png"),
+            )
+
+        for a in malicious:
+            save_vector_as_image(
+                received_models[a],
+                os.path.join(images_dir, "malicious", a, f"round_{current_round}.png"),
+            )
 
         # 5) Notify honeypot the real model
         msg_real = {

@@ -9,6 +9,7 @@ from kafka import KafkaProducer, KafkaConsumer
 from tensorflow.keras.datasets import cifar10
 
 IMG_SIZE = 32 * 32 * 3
+NOISE_SCALE = 10
 
 (_x_train, _y_train), _ = cifar10.load_data()
 
@@ -42,13 +43,15 @@ def get_random_cifar_vector():
 
 def ensure_cifar_vector(weights):
     if not isinstance(weights, list) or len(weights) != IMG_SIZE:
-        return get_random_cifar_vector()
+        print("[AGENT] WARNING: invalid weights received, ignoring image.")
+        return [0.0] * IMG_SIZE
+
     return weights
 
 
 def local_poison_train(weights):
     w = np.array(weights, dtype="float32")
-    noise = np.random.normal(loc=0.0, scale=40.0, size=w.shape)  # ruido fuerte
+    noise = np.random.normal(loc=0.0, scale=NOISE_SCALE, size=w.shape)  # strong noise
     w = np.clip(w + noise, 0.0, 255.0)
     return w.tolist()
 
