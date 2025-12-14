@@ -4,18 +4,58 @@ import os
 import random
 import time
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+from shared.model_utils import (
+    build_model,
+    vector_to_model,
+    model_to_vector,
+)
+from tensorflow.keras.datasets import cifar10
+import tensorflow as tf
+
 import numpy as np
 from kafka import KafkaProducer, KafkaConsumer
-from tensorflow.keras.datasets import cifar10
+
+IMG_SHAPE = (32, 32, 3)
+NUM_CLASSES = 10
 
 IMG_SIZE = 32 * 32 * 3
 
 (_x_train, _y_train), _ = cifar10.load_data()
 
+MAX_LOCAL_SAMPLES = 5000
+
+_x_train = _x_train[:MAX_LOCAL_SAMPLES].astype("float32") / 255.0
+_y_train = _y_train[:MAX_LOCAL_SAMPLES]
+_y_train = tf.keras.utils.to_categorical(_y_train, NUM_CLASSES)
+
 AGENT_ID = os.environ.get("AGENT_ID", "benign_1")
 
 _rng = random.Random(hash(AGENT_ID) & 0xFFFFFFFF)
 NOISE_SCALE = _rng.uniform(0.5, 2)
+
+# Every agent has one different
+def get_local_data():
+    total = _x_train.shape[0]
+    num_shards = 4
+
+    try:
+        suffix = int(AGENT_ID.split("_")[-1])
+        idx = (suffix - 1) % num_shards
+    except ValueError:
+        idx = 0
+
+    shard_size = total // num_shards
+    start = idx * shard_size
+    end = (idx + 1) * shard_size
+
+    print(f"[AGENT {AGENT_ID}] Using shard {idx} [{start}:{end}] of {total}")
+    return _x_train[start:end], _y_train[start:end]
+
+
+x_local, y_local = get_local_data()
 
 
 def preview(v):
@@ -55,11 +95,25 @@ def ensure_cifar_vector(weights):
     return weights
 
 
-def local_train(weights):
-    w = np.array(weights, dtype="float32")
-    noise = np.random.normal(loc=0.0, scale=NOISE_SCALE, size=w.shape)
-    w = np.clip(w + noise, 0.0, 255.0)
-    return w.tolist()
+def local_train(weights_vector):
+    # Rebuild model
+    model = build_model()
+    vector_to_model(model, weights_vector)
+
+    # Train
+    history = model.fit(
+        x_local,
+        y_local,
+        epochs=1,
+        batch_size=64,
+        verbose=0,
+    )
+
+    acc = history.history["accuracy"][-1]
+    print(f"[AGENT {AGENT_ID}] Local train accuracy: {acc:.4f}")
+
+    # Return updated values
+    return model_to_vector(model)
 
 
 def main():
@@ -88,7 +142,6 @@ def main():
 
         current_round = r
         weights = data.get("weights")
-        weights = ensure_cifar_vector(weights)
 
         print(f"[AGENT {AGENT_ID}] Round {r}, model received: {preview(weights)}")
 
@@ -99,7 +152,7 @@ def main():
         # Send to server
         msg_out = {
             "round": r,
-            "agent_id": AGENT_ID,  # <-- FIX 3
+            "agent_id": AGENT_ID,
             "weights": new_weights,
         }
         producer.send("agent.to.server", msg_out)

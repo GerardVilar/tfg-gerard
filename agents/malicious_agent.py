@@ -6,12 +6,69 @@ import time
 
 import numpy as np
 from kafka import KafkaProducer, KafkaConsumer
+from shared.model_utils import (
+    build_model,
+    vector_to_model,
+    model_to_vector,
+)
 from tensorflow.keras.datasets import cifar10
+import tensorflow as tf
+
+IMG_SHAPE = (32, 32, 3)
+NUM_CLASSES = 10
 
 IMG_SIZE = 32 * 32 * 3
 NOISE_SCALE = 10
 
 (_x_train, _y_train), _ = cifar10.load_data()
+
+MAX_LOCAL_SAMPLES = 5000
+
+_x_train = _x_train[:MAX_LOCAL_SAMPLES].astype("float32") / 255.0
+_y_train = _y_train[:MAX_LOCAL_SAMPLES]
+_y_train = tf.keras.utils.to_categorical(_y_train, NUM_CLASSES)
+
+AGENT_ID = os.environ.get("AGENT_ID", "malicious_1")
+
+def get_local_data():
+    total = _x_train.shape[0]
+    num_shards = 5
+    idx = num_shards - 1
+
+    shard_size = total // num_shards
+    start = idx * shard_size
+    end = (idx + 1) * shard_size
+
+    print(f"[AGENT {AGENT_ID}] Using shard {idx} [{start}:{end}] of {total} (MALICIOUS)")
+    return _x_train[start:end], _y_train[start:end]
+
+x_local, y_local_clean = get_local_data()
+
+def make_poison_labels(y):
+    y_poison = y.copy()
+    y_idx = np.argmax(y_poison, axis=1)
+    y_idx = (y_idx + 1) % NUM_CLASSES
+    y_poison = tf.keras.utils.to_categorical(y_idx, NUM_CLASSES)
+    return y_poison
+
+def local_poison_train(weights_vector):
+    model = build_model()
+    vector_to_model(model, weights_vector)
+
+    y_poison = make_poison_labels(y_local_clean)
+
+    history = model.fit(
+        x_local,
+        y_poison,
+        epochs=3,     # Lower or higher depending on the level of alteration desired
+        batch_size=64,
+        verbose=0,
+    )
+
+    acc = history.history["accuracy"][-1]
+    print(f"[AGENT {AGENT_ID}] Poison local train 'accuracy' (on wrong labels): {acc:.4f}")
+
+    return model_to_vector(model)
 
 def preview(v):
     return f"{v[:3]} ... ({len(v)} valores)"
@@ -32,29 +89,6 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
         auto_offset_reset="earliest",
         enable_auto_commit=True,
     )
-
-
-def get_random_cifar_vector():
-    idx = random.randrange(len(_x_train))
-    img = _x_train[idx].astype("float32")  # (32, 32, 3)
-    vec = img.flatten()
-    return vec.tolist()
-
-
-def ensure_cifar_vector(weights):
-    if not isinstance(weights, list) or len(weights) != IMG_SIZE:
-        print("[AGENT] WARNING: invalid weights received, ignoring image.")
-        return [0.0] * IMG_SIZE
-
-    return weights
-
-
-def local_poison_train(weights):
-    w = np.array(weights, dtype="float32")
-    noise = np.random.normal(loc=0.0, scale=NOISE_SCALE, size=w.shape)  # strong noise
-    w = np.clip(w + noise, 0.0, 255.0)
-    return w.tolist()
-
 
 def main():
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -79,7 +113,6 @@ def main():
 
         current_round = r
         weights = data.get("weights")
-        weights = ensure_cifar_vector(weights)
 
         def preview(v):
             return f"{v[:3]} ... ({len(v)} values)"

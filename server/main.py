@@ -2,6 +2,7 @@
 import json
 import os
 import time
+import csv
 import numpy as np
 
 from kafka import KafkaProducer, KafkaConsumer
@@ -9,36 +10,11 @@ from kafka.errors import NoBrokersAvailable
 from shared.model_utils import (
     init_model,
     average_models,
+    evaluate_vector_on_test,
 )
-from PIL import Image
-from tensorflow.keras.datasets import cifar10
-
-IMG_H, IMG_W, IMG_C = 32, 32, 3
-IMG_SIZE = IMG_H * IMG_W * IMG_C
-
-(_x_train, _y_train), _ = cifar10.load_data()
 
 def preview(v):
     return f"{v[:3]} ... ({len(v)} valores)"
-
-def get_random_cifar_vector():
-    idx = np.random.randint(0, len(_x_train))
-    img = _x_train[idx].astype("float32")
-    return img.flatten().tolist()
-
-#Image saving converting to PNG
-def save_vector_as_image(vec, filename):
-    if not isinstance(vec, (list, tuple)) or len(vec) != IMG_SIZE:
-        print(f"[SERVER] [WARN] No se puede guardar {filename}: tamaño {len(vec)} != {IMG_SIZE}")
-        return
-
-    arr = np.array(vec, dtype=np.float32)
-    arr = np.clip(arr, 0.0, 255.0).reshape(IMG_H, IMG_W, IMG_C).astype(np.uint8)
-    img = Image.fromarray(arr)
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    img.save(filename)
-    print(f"[SERVER] Imagen guardada en {filename}")
-
 
 def classify_by_distance(agent_models, factor=1.2):
     ids = list(agent_models.keys())
@@ -54,6 +30,11 @@ def classify_by_distance(agent_models, factor=1.2):
             d = np.linalg.norm(vecs[i] - vecs[j])
             dists.append(d)
         avg_dist[i] = np.mean(dists)
+
+    # DEBUG: see distances
+    print("[SERVER] Medium distances per agent:")
+    for aid in ids:
+        print(f"   {aid}: {avg_dist[aid]:.4f}")
 
     # Order (desc)
     sorted_ids = sorted(ids, key=lambda aid: avg_dist[aid], reverse=True)
@@ -107,10 +88,12 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
 
 def main():
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+
     agents_env = os.environ.get("AGENTS","benign_1,benign_2,benign_3,benign_4,malicious_1")
+
     agents = [a.strip() for a in agents_env.split(",") if a.strip()]
 
-    num_rounds = int(os.environ.get("NUM_ROUNDS", "10"))
+    num_rounds = int(os.environ.get("NUM_ROUNDS", "10000"))
     model_dim = int(os.environ.get("MODEL_DIM", "4"))
 
     print(f"[SERVER] Using bootstrap servers: {bootstrap}")
@@ -125,11 +108,29 @@ def main():
         bootstrap, "honeypot.to.server", group_id="server-hp"
     )
 
+    #LOG
+    log_path = os.environ.get(
+        "SERVER_METRICS_FILE",
+        "/app/shared/logs/training_metrics.csv"
+    )
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log_file = open(log_path, "w", newline="")
+    csv_writer = csv.writer(log_file)
+    csv_writer.writerow(
+        ["round", "num_benign", "num_malicious", "acc_benign", "acc_all"]
+    )
+    print(f"[SERVER] Logging metrics to {log_path}")
+
     # Reference model on the system
-    global_real_model = get_random_cifar_vector()
+    global_real_model = init_model(model_dim)
     print("[SERVER] Global model initialized.")
 
-    # State by agent
+    print("[SERVER] Evaluating initial model on test set...")
+
+    loss, acc = evaluate_vector_on_test(global_real_model, max_samples=5000)
+    print(f"[SERVER] Global test accuracy (benign-only): {acc:.4f}")
+
+    # State per agent
     per_agent_model = {a: list(global_real_model) for a in agents}
 
     current_round = 0
@@ -179,6 +180,31 @@ def main():
         print(f"[SERVER] Agentes benignos: {benign}")
         print(f"[SERVER] Agentes maliciosos: {malicious}")
 
+        benign_models = [received_models[a] for a in benign] if benign else []
+        all_models = list(received_models.values())
+
+        if benign_models:
+            benign_avg = average_models(benign_models)
+            _, acc_benign = evaluate_vector_on_test(benign_avg, max_samples=5000)
+        else:
+            acc_benign = None
+
+        all_avg = average_models(all_models)
+        _, acc_all = evaluate_vector_on_test(all_avg, max_samples=5000)
+
+        print(f"[SERVER] Accuracy con solo benignos: {acc_benign}")
+        print(f"[SERVER] Accuracy con benignos+malicioso: {acc_all}")
+
+        #Log to CSV
+        csv_writer.writerow([
+            current_round,
+            len(benign),
+            len(malicious),
+            "" if acc_benign is None else float(acc_benign),
+            "" if acc_all is None else float(acc_all),
+        ])
+        log_file.flush()
+
         # 4) Calculate real model
         if benign:
             benign_models = [received_models[a] for a in benign]
@@ -197,28 +223,6 @@ def main():
             )
 
         print(f"[SERVER] New REAL model: {preview(global_real_model)}")
-
-        # Save images
-        images_dir = "/app/shared/images"
-
-        # 4.1) Real model aggregated
-        save_vector_as_image(
-            global_real_model,
-            os.path.join(images_dir, "real", "/app/shared/images/initial_image.png"),
-        )
-
-        # 4.2) Models received per agent
-        for a in benign:
-            save_vector_as_image(
-                received_models[a],
-                os.path.join(images_dir, "benign", a, f"round_{current_round}.png"),
-            )
-
-        for a in malicious:
-            save_vector_as_image(
-                received_models[a],
-                os.path.join(images_dir, "malicious", a, f"round_{current_round}.png"),
-            )
 
         # 5) Notify honeypot the real model
         msg_real = {
