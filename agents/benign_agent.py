@@ -3,6 +3,8 @@ import json
 import os
 import random
 import time
+import csv
+
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -25,7 +27,7 @@ IMG_SIZE = 32 * 32 * 3
 
 (_x_train, _y_train), _ = cifar10.load_data()
 
-MAX_LOCAL_SAMPLES = 5000
+MAX_LOCAL_SAMPLES = 1000
 
 _x_train = _x_train[:MAX_LOCAL_SAMPLES].astype("float32") / 255.0
 _y_train = _y_train[:MAX_LOCAL_SAMPLES]
@@ -39,7 +41,7 @@ NOISE_SCALE = _rng.uniform(0.5, 2)
 # Every agent has one different
 def get_local_data():
     total = _x_train.shape[0]
-    num_shards = 4
+    num_shards = 3
 
     try:
         suffix = int(AGENT_ID.split("_")[-1])
@@ -59,7 +61,7 @@ x_local, y_local = get_local_data()
 
 
 def preview(v):
-    return f"{v[:3]} ... ({len(v)} valores)"
+    return f"{v[:3]} ... ({len(v)} values)"
 
 
 def create_producer(bootstrap_servers: str):
@@ -95,7 +97,7 @@ def ensure_cifar_vector(weights):
     return weights
 
 
-def local_train(weights_vector):
+def local_train(weights_vector, round_num: int, eval_every: int):
     # Rebuild model
     model = build_model()
     vector_to_model(model, weights_vector)
@@ -109,11 +111,14 @@ def local_train(weights_vector):
         verbose=0,
     )
 
-    acc = history.history["accuracy"][-1]
-    print(f"[AGENT {AGENT_ID}] Local train accuracy: {acc:.4f}")
+    train_acc = float(history.history["accuracy"][-1])
+    
+    eval_acc = None
+    if eval_every > 0 and (round_num % eval_every == 0):
+        _, eval_acc_val = model.evaluate(x_local, y_local, verbose=0)
+        eval_acc = float(eval_acc_val)
 
-    # Return updated values
-    return model_to_vector(model)
+    return model_to_vector(model), train_acc, eval_acc
 
 
 def main():
@@ -125,6 +130,19 @@ def main():
     consumer = create_consumer(
         bootstrap, "server.to.agent", group_id=f"agent-{AGENT_ID}"
     )
+
+    log_path = os.environ.get(
+        "AGENT_METRICS_FILE",
+        f"/app/shared/logs/{AGENT_ID}_metrics.csv"
+    )
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    
+    eval_every = int(os.environ.get("AGENT_EVAL_EVERY", "1"))
+
+    log_file = open(log_path, "w", newline="")
+    csv_writer = csv.writer(log_file)
+    csv_writer.writerow(["round", "train_acc", "eval_acc_clean"])
+    log_file.flush()
 
     current_round = 0
 
@@ -146,8 +164,20 @@ def main():
         print(f"[AGENT {AGENT_ID}] Round {r}, model received: {preview(weights)}")
 
         # Train locally
-        new_weights = local_train(weights)
-        print(f"[AGENT {AGENT_ID}] Round {r}, trained model: {preview(new_weights)}")
+        new_weights, train_acc, eval_acc = local_train(weights, r, eval_every)
+
+        print(f"[AGENT {AGENT_ID}] Local train accuracy: {train_acc:.4f}")
+        if eval_acc is not None:
+            print(f"[AGENT {AGENT_ID}] Local eval accuracy (clean): {eval_acc:.4f}")
+        else:
+            print(f"[AGENT {AGENT_ID}] Local eval skipped (eval_every={eval_every})")
+
+        csv_writer.writerow([
+            r,
+            train_acc,
+            "" if eval_acc is None else eval_acc,
+        ])
+        log_file.flush()
 
         # Send to server
         msg_out = {
@@ -159,7 +189,7 @@ def main():
         producer.flush()
         print(f"[AGENT {AGENT_ID}] -> Model sent to server")
 
-        time.sleep(0.5)
+        time.sleep(0)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,6 @@ COPY main.py wait-for-kafka.sh ./
 RUN chmod +x wait-for-kafka.sh
 
 # Instala confluent-kafka y kafka-python
-RUN pip install --no-cache-dir confluent-kafka kafka-python
+RUN pip install --no-cache-dir confluent-kafka kafka-python numpy
 
 CMD ["./wait-for-kafka.sh"]

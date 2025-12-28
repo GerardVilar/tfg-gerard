@@ -1,5 +1,6 @@
 import json
 import os
+import numpy as np
 from kafka import KafkaProducer, KafkaConsumer
 
 def create_producer(bootstrap_servers: str):
@@ -20,33 +21,51 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
 
 def main():
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+    alpha = float(os.environ.get("HP_ALPHA", "0.33"))
+    beta  = float(os.environ.get("HP_BETA", "0.67"))
 
-    print("[HONEYPOT] Booting honeypot")
+    print(f"[HONEYPOT] Booting honeypot | alpha={alpha} beta={beta}")
 
-    consumer = create_consumer(bootstrap, "server.to.honeypot", "honeypot")
+    consumer_real = create_consumer(bootstrap, "server.broadcast.real", "honeypot-real")
+    
+    consumer_mal = create_consumer(bootstrap, "server.to.honeypot", "honeypot-mal")
     producer = create_producer(bootstrap)
 
-    for msg in consumer:
+    last_real_by_round = {}  # round -> weights
+
+    while True:
+        msg_real = next(consumer_real, None)
+        if msg_real is not None:
+            data = msg_real.value
+            r = data.get("round")
+            w = data.get("weights")
+            if r is not None and w is not None:
+                last_real_by_round[r] = w
+
+        msg = next(consumer_mal)
         data = msg.value
         round_ = data.get("round")
         agent_id = data.get("agent_id")
-        weights = data.get("weights")
+        mal_w = data.get("weights")
 
-        print(f"[HONEYPOT] Modelo recibido de {agent_id} en ronda {round_}")
+        real_w = last_real_by_round.get(round_, last_real_by_round.get(round_-1))
+        if real_w is None:
+            real_w = mal_w  # fallback
 
-        # Just sends the same model
-        fake_weights = weights
+        real_arr = np.array(real_w, dtype=np.float32)
+        mal_arr  = np.array(mal_w, dtype=np.float32)
 
-        # Respond the server
+        fake = (alpha * real_arr + beta * mal_arr).tolist()
+
         msg_back = {
             "round": round_,
             "agent_id": agent_id,
-            "weights": fake_weights
+            "weights": fake
         }
 
         producer.send("honeypot.to.server", msg_back)
         producer.flush()
-        print(f"[HONEYPOT] Modelo procesado para {agent_id} enviado al servidor")
+        print(f"[HONEYPOT] Sent fake model for {agent_id} round {round_}")
 
 if __name__ == "__main__":
     main()

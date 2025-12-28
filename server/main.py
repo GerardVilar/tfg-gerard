@@ -1,9 +1,22 @@
 # server/main.py
+
 import json
 import os
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+ENABLE_DETECTION = os.environ.get("ENABLE_DETECTION", "1") == "1"
+
 import time
 import csv
 import numpy as np
+import tensorflow as tf
+tf.config.threading.set_intra_op_parallelism_threads(int(os.environ.get("TF_INTRA", "1")))
+tf.config.threading.set_inter_op_parallelism_threads(int(os.environ.get("TF_INTER", "1")))
+
+suspicion_rounds = int(os.environ.get("SUSPICION_ROUNDS", "3"))
+decay = int(os.environ.get("SUSPICION_DECAY", "1"))
 
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
@@ -12,9 +25,10 @@ from shared.model_utils import (
     average_models,
     evaluate_vector_on_test,
 )
+from collections import defaultdict
 
 def preview(v):
-    return f"{v[:3]} ... ({len(v)} valores)"
+    return f"{v[:3]} ... ({len(v)} values)"
 
 def classify_by_distance(agent_models, factor=1.2):
     ids = list(agent_models.keys())
@@ -89,16 +103,21 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
 def main():
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
-    agents_env = os.environ.get("AGENTS","benign_1,benign_2,benign_3,benign_4,malicious_1")
+    agents_env = os.environ.get("AGENTS","benign_1,benign_2,malicious_1")
 
     agents = [a.strip() for a in agents_env.split(",") if a.strip()]
 
-    num_rounds = int(os.environ.get("NUM_ROUNDS", "10000"))
+    num_rounds = int(os.environ.get("NUM_ROUNDS", "1000"))
     model_dim = int(os.environ.get("MODEL_DIM", "4"))
+
+    eval_every = int(os.environ.get("EVAL_EVERY", "1"))
+
+    sleep_s = float(os.environ.get("SLEEP_SECONDS", "0"))
 
     print(f"[SERVER] Using bootstrap servers: {bootstrap}")
     print(f"[SERVER] Starting with agents: {agents}")
     print(f"[SERVER] Rounds: {num_rounds}, model dim: {model_dim}")
+    print(f"[SERVER] Evaluating model every {eval_every} rounds")
 
     producer = create_producer(bootstrap)
     consumer_updates = create_consumer(
@@ -127,7 +146,7 @@ def main():
 
     print("[SERVER] Evaluating initial model on test set...")
 
-    loss, acc = evaluate_vector_on_test(global_real_model, max_samples=5000)
+    loss, acc = evaluate_vector_on_test(global_real_model, max_samples=1000)
     print(f"[SERVER] Global test accuracy (benign-only): {acc:.4f}")
 
     # State per agent
@@ -135,9 +154,12 @@ def main():
 
     current_round = 0
 
+    suspicion_counts = defaultdict(int)
+    isolated = set()
+
     while current_round < num_rounds:
         current_round += 1
-        print(f"\n[SERVER] ==== RONDA {current_round} ====")
+        print(f"\n[SERVER] ==== ROUND {current_round} ====")
 
         # 1) Send the model to every agent
         for agent_id in agents:
@@ -172,28 +194,58 @@ def main():
                 continue
 
             received_models[agent_id] = weights
-            print(f"[SERVER] <- Recibido modelo de {agent_id}")
+            print(f"[SERVER] <- Received model of {agent_id}")
 
         # 3) Detect of malicious agents
-        benign, malicious = classify_by_distance(received_models, factor=1.2)
+        if ENABLE_DETECTION:
+            benign_tmp, suspicious = classify_by_distance(received_models, factor=1.2)
+
+            all_ids = list(received_models.keys())
+            suspicious_set = set(suspicious)
+
+            for aid in all_ids:
+                if aid in suspicious_set:
+                    suspicion_counts[aid] += 1
+                else:
+                    suspicion_counts[aid] = max(0, suspicion_counts[aid] - decay)
+
+            new_isolated = {aid for aid, c in suspicion_counts.items() if c >= suspicion_rounds}
+            isolated |= new_isolated
+
+            malicious = sorted(list(isolated))
+            benign = sorted([a for a in all_ids if a not in isolated])
+        else:
+            suspicious_set = []
+            benign = list(received_models.keys())
+            malicious = []
+        print(f"[SERVER] Suspicious this round: {sorted(list(suspicious_set))}")
+        print(f"[SERVER] Suspicion counters: {dict(suspicion_counts)}")
+        print(f"[SERVER] ISOLATED malicious: {malicious}")
+        print(f"[SERVER] Benign: {benign}")
         
-        print(f"[SERVER] Agentes benignos: {benign}")
-        print(f"[SERVER] Agentes maliciosos: {malicious}")
+        print(f"[SERVER] Benign Agents: {benign}")
+        print(f"[SERVER] Malicious Agents: {malicious}")
 
         benign_models = [received_models[a] for a in benign] if benign else []
         all_models = list(received_models.values())
 
-        if benign_models:
-            benign_avg = average_models(benign_models)
-            _, acc_benign = evaluate_vector_on_test(benign_avg, max_samples=5000)
+        acc_benign = None
+        acc_all = None
+
+        if current_round % eval_every == 0:
+            print(f"[SERVER] Evaluating models at round {current_round}")
+
+            if benign_models:
+                benign_avg = average_models(benign_models)
+                _, acc_benign = evaluate_vector_on_test(benign_avg, max_samples=1000)
+
+            all_avg = average_models(all_models)
+            _, acc_all = evaluate_vector_on_test(all_avg, max_samples=1000)
+
+            print(f"[SERVER] Accuracy only with benigns: {acc_benign}")
+            print(f"[SERVER] Accuracy with benigns + malicious: {acc_all}")
         else:
-            acc_benign = None
-
-        all_avg = average_models(all_models)
-        _, acc_all = evaluate_vector_on_test(all_avg, max_samples=5000)
-
-        print(f"[SERVER] Accuracy con solo benignos: {acc_benign}")
-        print(f"[SERVER] Accuracy con benignos+malicioso: {acc_all}")
+            print("[SERVER] Skipping evaluation this round")
 
         #Log to CSV
         csv_writer.writerow([
@@ -244,12 +296,12 @@ def main():
                     "weights": received_models[mal],
                 }
                 producer.send("server.to.honeypot", msg_mal)
-                print(f"[SERVER] -> Modelo malicioso enviado al honeypot ({mal})")
+                print(f"[SERVER] -> Malicious agent sent to Honeypot ({mal})")
             producer.flush()
 
             # Wait for honeypot responses
             pending_hp = set(malicious)
-            print("[SERVER] Esperando modelos honeypot...")
+            print("[SERVER] Waiting Honeypot models...")
             while pending_hp:
                 msg_hp = next(consumer_hp)
                 data_hp = msg_hp.value
@@ -264,7 +316,7 @@ def main():
 
                 hp_models[agent_hp] = weights_hp
                 pending_hp.remove(agent_hp)
-                print(f"[SERVER] <- Modelo honeypot recibido para {agent_hp}")
+                print(f"[SERVER] <- Honeypot model received for {agent_hp}")
 
         # 7) Update the models to be seen for the agents
         for a in agents:
@@ -273,14 +325,15 @@ def main():
             else:
                 per_agent_model[a] = global_real_model
 
-        print("[SERVER] Estado per-agent para próxima ronda:")
+        print("[SERVER] Per-agent state for next round:")
         for a in agents:
             print(f"   {a}: {preview(per_agent_model[a])}")
 
         # Pause
-        time.sleep(1.0)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
-    print("[SERVER] Fin de las rondas. Saliendo...")
+    print("[SERVER] End of rounds. Exiting...")
 
 
 if __name__ == "__main__":

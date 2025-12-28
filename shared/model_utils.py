@@ -63,14 +63,25 @@ def average_models(list_of_vectors: list[list[float]]) -> list[float]:
     arr = np.stack([np.array(v, dtype="float32") for v in list_of_vectors])
     return np.mean(arr, axis=0).tolist()
 
+_EVAL_MODEL = None
+
+def _get_eval_model():
+    global _EVAL_MODEL
+    if _EVAL_MODEL is None:
+        _EVAL_MODEL = build_model()
+    return _EVAL_MODEL
 
 # Global evaluation of the server
-def evaluate_vector_on_test(vector: list[float], max_samples: int = 200):
-    model = build_model()
+def evaluate_vector_on_test(vector: list[float], max_samples: int = 1000):
+    model = _get_eval_model()
     vector_to_model(model, vector)
 
-    xs = x_test[:max_samples]
-    ys = y_test[:max_samples]
+    if max_samples is not None:
+        x = x_test[:max_samples]
+        y = y_test[:max_samples]
+    else:
+        x = x_test
+        y = y_test
 
-    loss, acc = model.evaluate(xs, ys, verbose=0)
+    loss, acc = model.evaluate(x, y, verbose=0)
     return loss, acc

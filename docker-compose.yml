@@ -28,9 +28,14 @@ services:
       - kafka
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-      AGENTS: "benign_1,benign_2,benign_3,benign_4,malicious_1"
+      AGENTS: "benign_1,benign_2,malicious_1"
       NUM_ROUNDS: "1000"
       MODEL_DIM: "4"
+      EVAL_EVERY: "1"
+      SLEEP_SECONDS: "0"
+      TF_INTRA: "1"
+      TF_INTER: "1"
+      ENABLE_DETECTION: "0"
     volumes:
       - ./shared:/app/shared
 
@@ -43,6 +48,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       HP_ALPHA: "0.33"
       HP_BETA: "0.67"
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./shared:/app/shared
 
@@ -53,7 +59,7 @@ services:
       - kafka
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-      AGENT_ID: "benign_1"
+      PYTHONUNBUFFERED: "1"
     command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
     volumes:
       - ./shared:/app/shared
@@ -66,33 +72,36 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       AGENT_ID: "benign_2"
+      PYTHONUNBUFFERED: "1"
     command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
     volumes:
       - ./shared:/app/shared
 
-  agent_benign_3:
-    build:
-      context: ./agents
-    depends_on:
-      - kafka
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-      AGENT_ID: "benign_3"
-    command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
-    volumes:
-      - ./shared:/app/shared
+  #agent_benign_3:
+  #  build:
+  #    context: ./agents
+  #  depends_on:
+  #    - kafka
+  #  environment:
+  #    KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  #    AGENT_ID: "benign_3"
+  #    PYTHONUNBUFFERED: "1"
+  #  command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
+  #  volumes:
+  #    - ./shared:/app/shared
 
-  agent_benign_4:
-    build:
-      context: ./agents
-    depends_on:
-      - kafka
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-      AGENT_ID: "benign_4"
-    command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
-    volumes:
-      - ./shared:/app/shared
+  #agent_benign_4:
+  #  build:
+  #    context: ./agents
+  #  depends_on:
+  #    - kafka
+  #  environment:
+  #    KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  #    AGENT_ID: "benign_4"
+  #    PYTHONUNBUFFERED: "1"
+  #  command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
+  #  volumes:
+  #    - ./shared:/app/shared
 
   agent_malicious:
     build:
@@ -102,6 +111,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       AGENT_ID: "malicious_1"
+      PYTHONUNBUFFERED: "1"
     command: ["./wait-for-kafka.sh", "python", "malicious_agent.py"]
     volumes:
       - ./shared:/app/shared
