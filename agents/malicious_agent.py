@@ -5,7 +5,6 @@ import random
 import time
 import csv
 
-
 import numpy as np
 from kafka import KafkaProducer, KafkaConsumer
 from shared.model_utils import (
@@ -16,11 +15,13 @@ from shared.model_utils import (
 from tensorflow.keras.datasets import cifar10
 import tensorflow as tf
 
-IMG_SHAPE = (32, 32, 3)
 NUM_CLASSES = 10
 
-IMG_SIZE = 32 * 32 * 3
-NOISE_SCALE = 10
+ATTACK_MODE = os.environ.get("ATTACK_MODE", "vehicles_to_car")  # shift | vehicles_to_car
+TARGET_CLASS = int(os.environ.get("TARGET_CLASS", "1"))  # automobile = 1
+VEHICLE_CLASSES = {0, 1, 8, 9}
+ATTACK_START_ROUND = int(os.environ.get("ATTACK_START_ROUND", "10"))
+AGENT_EVAL_EVERY = int(os.environ.get("AGENT_EVAL_EVERY", "1"))
 
 (_x_train, _y_train), _ = cifar10.load_data()
 
@@ -34,7 +35,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "malicious_1")
 
 def get_local_data():
     total = _x_train.shape[0]
-    num_shards = 3
+    num_shards = 4
     idx = num_shards - 1
 
     shard_size = total // num_shards
@@ -46,26 +47,54 @@ def get_local_data():
 
 x_local, y_local_clean = get_local_data()
 
-def make_poison_labels(y):
-    y_poison = y.copy()
-    y_idx = np.argmax(y_poison, axis=1)
-    y_idx = (y_idx + 1) % NUM_CLASSES
-    y_poison = tf.keras.utils.to_categorical(y_idx, NUM_CLASSES)
-    return y_poison
+def local_benign_train(weights_vector, round_num: int, eval_every: int):
+    model = build_model()
+    vector_to_model(model, weights_vector)
+
+    history = model.fit(
+        x_local,
+        y_local_clean,
+        epochs=1,
+        batch_size=64,
+        verbose=0,
+    )
+    train_acc = float(history.history["accuracy"][-1])
+
+    eval_acc = None
+    if eval_every > 0 and (round_num % eval_every == 0):
+        _, eval_acc_val = model.evaluate(x_local, y_local_clean, verbose=0)
+        eval_acc = float(eval_acc_val)
+
+    return model_to_vector(model), train_acc, eval_acc
+
+def make_poison_labels(y_clean):
+    y_idx = np.argmax(y_clean, axis=1)
+
+    if ATTACK_MODE == "vehicles_to_car":
+        y_poison_idx = y_idx.copy()
+        mask = np.isin(y_idx, list(VEHICLE_CLASSES))
+        y_poison_idx[mask] = TARGET_CLASS
+        return tf.keras.utils.to_categorical(y_poison_idx, NUM_CLASSES)
+
+    # default: shift
+    y_poison_idx = (y_idx + 1) % NUM_CLASSES
+    return tf.keras.utils.to_categorical(y_poison_idx, NUM_CLASSES)
 
 def local_poison_train(weights_vector, round_num: int, eval_every: int):
     model = build_model()
     vector_to_model(model, weights_vector)
 
-    y_poison = make_poison_labels(y_local_clean)
+    y_train_used = make_poison_labels(y_local_clean)
 
     history = model.fit(
         x_local,
-        y_poison,
+        y_train_used,
         epochs=3,     # Lower or higher depending on the level of alteration desired
         batch_size=64,
         verbose=0,
     )
+
+    print(f"[AGENT {AGENT_ID}] ATTACK_MODE={ATTACK_MODE}, TARGET_CLASS={TARGET_CLASS}")
 
     train_acc_poison = float(history.history["accuracy"][-1])
 
@@ -73,7 +102,7 @@ def local_poison_train(weights_vector, round_num: int, eval_every: int):
     eval_acc_clean = None
 
     if eval_every > 0 and (round_num % eval_every == 0):
-        _, eval_acc_poison_val = model.evaluate(x_local, y_poison, verbose=0)
+        _, eval_acc_poison_val = model.evaluate(x_local, y_train_used, verbose=0)
         _, eval_acc_clean_val = model.evaluate(x_local, y_local_clean, verbose=0)
         eval_acc_poison = float(eval_acc_poison_val)
         eval_acc_clean = float(eval_acc_clean_val)
@@ -145,9 +174,19 @@ def main():
         print(f"[AGENT {agent_id}] Round {r}, model received: {preview(weights)}")
 
         # Malicious training
-        new_weights, train_acc_poison, eval_acc_poison, eval_acc_clean = local_poison_train(weights, r, eval_every)
+        attack_active = (r >= ATTACK_START_ROUND)
 
-        print(f"[AGENT {agent_id}] Poison train acc (poison labels): {train_acc_poison:.4f}")
+        if not attack_active:
+            new_weights, train_acc_clean, eval_acc_clean = local_benign_train(weights, r, AGENT_EVAL_EVERY)
+            train_acc_poison = None
+            eval_acc_poison = None
+            print(f"[AGENT {agent_id}] Benign mode (no attack yet).")
+        else:
+            new_weights, train_acc_poison, eval_acc_poison, eval_acc_clean = local_poison_train(weights, r, AGENT_EVAL_EVERY)
+            train_acc_clean = None
+            print(f"[AGENT {agent_id}] ATTACK ACTIVE (mode={ATTACK_MODE})")
+        if train_acc_poison is not None:
+            print(f"[AGENT {agent_id}] Poison train acc (poison labels): {train_acc_poison:.4f}")
         if eval_acc_poison is not None:
             print(f"[AGENT {agent_id}] Eval acc (poison labels): {eval_acc_poison:.4f}")
             print(f"[AGENT {agent_id}] Eval acc (clean labels): {eval_acc_clean:.4f}")

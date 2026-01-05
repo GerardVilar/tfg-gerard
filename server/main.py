@@ -54,7 +54,7 @@ def classify_by_distance(agent_models, factor=1.2):
     sorted_ids = sorted(ids, key=lambda aid: avg_dist[aid], reverse=True)
 
     if len(sorted_ids) < 3:
-        return ids, []
+        return ids, [], avg_dist
 
     worst = sorted_ids[0]
     second = sorted_ids[1]
@@ -66,7 +66,7 @@ def classify_by_distance(agent_models, factor=1.2):
         malicious = []
         benign = ids
 
-    return benign, malicious
+    return benign, malicious, avg_dist
 
 def create_producer(bootstrap_servers: str, max_retries: int = 10, delay: float = 3.0):
     for attempt in range(1, max_retries + 1):
@@ -103,7 +103,7 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
 def main():
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
-    agents_env = os.environ.get("AGENTS","benign_1,benign_2,malicious_1")
+    agents_env = os.environ.get("AGENTS","benign_1,benign_2,benign_3,malicious_1")
 
     agents = [a.strip() for a in agents_env.split(",") if a.strip()]
 
@@ -139,6 +139,11 @@ def main():
         ["round", "num_benign", "num_malicious", "acc_benign", "acc_all"]
     )
     print(f"[SERVER] Logging metrics to {log_path}")
+
+    cluster_log_path = "/app/shared/logs/clustering_metrics.csv"
+    cluster_log = open(cluster_log_path, "w", newline="")
+    cluster_writer = csv.writer(cluster_log)
+    cluster_writer.writerow(["round", "agent_id", "avg_distance", "label"])
 
     # Reference model on the system
     global_real_model = init_model(model_dim)
@@ -198,7 +203,24 @@ def main():
 
         # 3) Detect of malicious agents
         if ENABLE_DETECTION:
-            benign_tmp, suspicious = classify_by_distance(received_models, factor=1.2)
+            benign_tmp, suspicious, avg_dist = classify_by_distance(received_models, factor=1.2)
+
+            for aid, dist in avg_dist.items():
+                if aid in isolated:
+                    label = "isolated"
+                elif aid in suspicious:
+                    label = "suspicious"
+                else:
+                    label = "benign"
+
+                cluster_writer.writerow([
+                    current_round,
+                    aid,
+                    dist,
+                    label
+                ])
+
+            cluster_log.flush()
 
             all_ids = list(received_models.keys())
             suspicious_set = set(suspicious)

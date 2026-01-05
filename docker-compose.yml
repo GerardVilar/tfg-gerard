@@ -28,14 +28,14 @@ services:
       - kafka
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-      AGENTS: "benign_1,benign_2,malicious_1"
+      AGENTS: "benign_1,benign_2,benign_3,malicious_1"
       NUM_ROUNDS: "1000"
       MODEL_DIM: "4"
       EVAL_EVERY: "1"
       SLEEP_SECONDS: "0"
       TF_INTRA: "1"
       TF_INTER: "1"
-      ENABLE_DETECTION: "0"
+      ENABLE_DETECTION: "1"
     volumes:
       - ./shared:/app/shared
 
@@ -77,18 +77,18 @@ services:
     volumes:
       - ./shared:/app/shared
 
-  #agent_benign_3:
-  #  build:
-  #    context: ./agents
-  #  depends_on:
-  #    - kafka
-  #  environment:
-  #    KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-  #    AGENT_ID: "benign_3"
-  #    PYTHONUNBUFFERED: "1"
-  #  command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
-  #  volumes:
-  #    - ./shared:/app/shared
+  agent_benign_3:
+    build:
+      context: ./agents
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      AGENT_ID: "benign_3"
+      PYTHONUNBUFFERED: "1"
+    command: ["./wait-for-kafka.sh", "python", "benign_agent.py"]
+    volumes:
+      - ./shared:/app/shared
 
   #agent_benign_4:
   #  build:
@@ -112,6 +112,10 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       AGENT_ID: "malicious_1"
       PYTHONUNBUFFERED: "1"
+      ATTACK_MODE: "shift"
+      ATTACK_START_ROUND: "1"
+      AGENT_EVAL_EVERY: "1"
+      TARGET_CLASS: "1"
     command: ["./wait-for-kafka.sh", "python", "malicious_agent.py"]
     volumes:
       - ./shared:/app/shared

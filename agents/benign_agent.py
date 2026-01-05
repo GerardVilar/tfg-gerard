@@ -41,7 +41,7 @@ NOISE_SCALE = _rng.uniform(0.5, 2)
 # Every agent has one different
 def get_local_data():
     total = _x_train.shape[0]
-    num_shards = 3
+    num_shards = 4
 
     try:
         suffix = int(AGENT_ID.split("_")[-1])
