@@ -36,6 +36,7 @@ services:
       TF_INTRA: "1"
       TF_INTER: "1"
       ENABLE_DETECTION: "1"
+      DETECTION_START_ROUND: "1"
     volumes:
       - ./shared:/app/shared
 
