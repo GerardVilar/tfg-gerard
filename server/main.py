@@ -1,40 +1,61 @@
-# server/main.py
-
 import json
 import os
 
+# Reduce TensorFlow log verbosity
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+# Disable GPU usage to force CPU-only execution
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
+# Enable or disable malicious detection logic
 ENABLE_DETECTION = os.environ.get("ENABLE_DETECTION", "1") == "1"
 
 import time
 import csv
 import numpy as np
 import tensorflow as tf
-tf.config.threading.set_intra_op_parallelism_threads(int(os.environ.get("TF_INTRA", "1")))
-tf.config.threading.set_inter_op_parallelism_threads(int(os.environ.get("TF_INTER", "1")))
 
+# Configure TensorFlow threading to control CPU parallelism
+tf.config.threading.set_intra_op_parallelism_threads(
+    int(os.environ.get("TF_INTRA", "1"))
+)
+tf.config.threading.set_inter_op_parallelism_threads(
+    int(os.environ.get("TF_INTER", "1"))
+)
+
+# Number of consecutive suspicious rounds required to isolate an agent
 suspicion_rounds = int(os.environ.get("SUSPICION_ROUNDS", "3"))
+
+# Decay applied to suspicion counter when agent behaves normally
 decay = int(os.environ.get("SUSPICION_DECAY", "1"))
 
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
+
+# Model utility functions shared across components
 from shared.model_utils import (
     init_model,
     average_models,
     evaluate_vector_on_test,
 )
+
 from collections import defaultdict
 
+
+# Utility function to display a short preview of a model vector
 def preview(v):
     return f"{v[:3]} ... ({len(v)} values)"
 
+
+# Classify agents based on the average distance of their model to others
 def classify_by_distance(agent_models, factor=1.2):
+    # Extract agent identifiers
     ids = list(agent_models.keys())
+
+    # Convert all agent models to NumPy arrays
     vecs = {aid: np.array(agent_models[aid], dtype=float) for aid in ids}
 
-    # Average distance
+    # Compute average distance to all other agents
     avg_dist = {}
     for i in ids:
         dists = []
@@ -45,20 +66,23 @@ def classify_by_distance(agent_models, factor=1.2):
             dists.append(d)
         avg_dist[i] = np.mean(dists)
 
-    # DEBUG: see distances
+    # Print distance diagnostics
     print("[SERVER] Medium distances per agent:")
     for aid in ids:
         print(f"   {aid}: {avg_dist[aid]:.4f}")
 
-    # Order (desc)
+    # Sort agents by distance (descending)
     sorted_ids = sorted(ids, key=lambda aid: avg_dist[aid], reverse=True)
 
+    # Not enough agents to perform meaningful detection
     if len(sorted_ids) < 3:
         return ids, [], avg_dist
 
+    # Select the two most distant agents
     worst = sorted_ids[0]
     second = sorted_ids[1]
 
+    # Mark agent as malicious if it is significantly more distant
     if avg_dist[worst] > factor * avg_dist[second]:
         malicious = [worst]
         benign = [a for a in ids if a != worst]
@@ -68,6 +92,8 @@ def classify_by_distance(agent_models, factor=1.2):
 
     return benign, malicious, avg_dist
 
+
+# Create a Kafka producer with retry logic
 def create_producer(bootstrap_servers: str, max_retries: int = 10, delay: float = 3.0):
     for attempt in range(1, max_retries + 1):
         try:
@@ -83,11 +109,13 @@ def create_producer(bootstrap_servers: str, max_retries: int = 10, delay: float 
             print(f"[SERVER] No brokers available yet, retrying in {delay}s...")
             time.sleep(delay)
 
+    # Abort if Kafka is unreachable
     raise RuntimeError(
         f"[SERVER] Could not connect to Kafka after {max_retries} attempts."
     )
 
 
+# Create a Kafka consumer for a specific topic
 def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
     return KafkaConsumer(
         topic,
@@ -101,24 +129,30 @@ def create_consumer(bootstrap_servers: str, topic: str, group_id: str):
 
 
 def main():
+    # Kafka bootstrap server address
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
-    agents_env = os.environ.get("AGENTS","benign_1,benign_2,benign_3,malicious_1")
-
+    # List of participating agents
+    agents_env = os.environ.get(
+        "AGENTS", "benign_1,benign_2,benign_3,malicious_1"
+    )
     agents = [a.strip() for a in agents_env.split(",") if a.strip()]
 
+    # Training and evaluation parameters
     num_rounds = int(os.environ.get("NUM_ROUNDS", "1000"))
     model_dim = int(os.environ.get("MODEL_DIM", "4"))
-
     eval_every = int(os.environ.get("EVAL_EVERY", "1"))
-
     sleep_s = float(os.environ.get("SLEEP_SECONDS", "0"))
+
+    # Round number from which detection is enabled
+    detection_start_round = int(os.environ.get("DETECTION_START_ROUND", "1"))
 
     print(f"[SERVER] Using bootstrap servers: {bootstrap}")
     print(f"[SERVER] Starting with agents: {agents}")
     print(f"[SERVER] Rounds: {num_rounds}, model dim: {model_dim}")
     print(f"[SERVER] Evaluating model every {eval_every} rounds")
 
+    # Initialize Kafka communication
     producer = create_producer(bootstrap)
     consumer_updates = create_consumer(
         bootstrap, "agent.to.server", group_id="server-updates"
@@ -127,7 +161,7 @@ def main():
         bootstrap, "honeypot.to.server", group_id="server-hp"
     )
 
-    #LOG
+    # Setup training metrics logging
     log_path = os.environ.get(
         "SERVER_METRICS_FILE",
         "/app/shared/logs/training_metrics.csv"
@@ -140,33 +174,37 @@ def main():
     )
     print(f"[SERVER] Logging metrics to {log_path}")
 
+    # Setup clustering diagnostics logging
     cluster_log_path = "/app/shared/logs/clustering_metrics.csv"
     cluster_log = open(cluster_log_path, "w", newline="")
     cluster_writer = csv.writer(cluster_log)
     cluster_writer.writerow(["round", "agent_id", "avg_distance", "label"])
 
-    # Reference model on the system
+    # Initialize the global reference model
     global_real_model = init_model(model_dim)
     print("[SERVER] Global model initialized.")
 
     print("[SERVER] Evaluating initial model on test set...")
-
     loss, acc = evaluate_vector_on_test(global_real_model, max_samples=1000)
     print(f"[SERVER] Global test accuracy (benign-only): {acc:.4f}")
 
-    # State per agent
+    # Initialize per-agent model states
     per_agent_model = {a: list(global_real_model) for a in agents}
 
     current_round = 0
 
+    # Structures to track suspicion and isolation
     suspicion_counts = defaultdict(int)
     isolated = set()
 
+    # =========================
+    # Main federated loop
+    # =========================
     while current_round < num_rounds:
         current_round += 1
         print(f"\n[SERVER] ==== ROUND {current_round} ====")
 
-        # 1) Send the model to every agent
+        # 1) Send current model to each agent
         for agent_id in agents:
             msg = {
                 "round": current_round,
@@ -177,7 +215,7 @@ def main():
             print(f"[SERVER] -> Sent model to {agent_id}")
         producer.flush()
 
-        # 2) Receive models from every agent
+        # 2) Collect updated models from agents
         received_models = {}
         print("[SERVER] Waiting for the agents model...")
         while len(received_models) < len(agents):
@@ -187,24 +225,30 @@ def main():
             agent_id = data.get("agent_id")
             weights = data.get("weights")
 
+            # Ignore messages from other rounds
             if r != current_round:
-                # Old model message, ignore
                 continue
 
+            # Ignore unknown agents
             if agent_id not in agents:
                 continue
 
+            # Ignore duplicate submissions
             if agent_id in received_models:
-                # Agent on possesion
                 continue
 
             received_models[agent_id] = weights
             print(f"[SERVER] <- Received model of {agent_id}")
 
-        # 3) Detect of malicious agents
-        if ENABLE_DETECTION:
-            benign_tmp, suspicious, avg_dist = classify_by_distance(received_models, factor=1.2)
+        # 3) Malicious agent detection
+        detection_active = ENABLE_DETECTION and (current_round >= detection_start_round)
 
+        if detection_active:
+            benign_tmp, suspicious, avg_dist = classify_by_distance(
+                received_models, factor=1.2
+            )
+
+            # Log clustering labels
             for aid, dist in avg_dist.items():
                 if aid in isolated:
                     label = "isolated"
@@ -212,26 +256,24 @@ def main():
                     label = "suspicious"
                 else:
                     label = "benign"
-
-                cluster_writer.writerow([
-                    current_round,
-                    aid,
-                    dist,
-                    label
-                ])
-
+                cluster_writer.writerow([current_round, aid, dist, label])
             cluster_log.flush()
 
             all_ids = list(received_models.keys())
             suspicious_set = set(suspicious)
 
+            # Update suspicion counters
             for aid in all_ids:
                 if aid in suspicious_set:
                     suspicion_counts[aid] += 1
                 else:
                     suspicion_counts[aid] = max(0, suspicion_counts[aid] - decay)
 
-            new_isolated = {aid for aid, c in suspicion_counts.items() if c >= suspicion_rounds}
+            # Isolate agents exceeding suspicion threshold
+            new_isolated = {
+                aid for aid, c in suspicion_counts.items()
+                if c >= suspicion_rounds
+            }
             isolated |= new_isolated
 
             malicious = sorted(list(isolated))
@@ -240,11 +282,14 @@ def main():
             suspicious_set = []
             benign = list(received_models.keys())
             malicious = []
+            suspicion_counts.clear()
+            isolated.clear()
+
         print(f"[SERVER] Suspicious this round: {sorted(list(suspicious_set))}")
         print(f"[SERVER] Suspicion counters: {dict(suspicion_counts)}")
         print(f"[SERVER] ISOLATED malicious: {malicious}")
         print(f"[SERVER] Benign: {benign}")
-        
+
         print(f"[SERVER] Benign Agents: {benign}")
         print(f"[SERVER] Malicious Agents: {malicious}")
 
@@ -254,22 +299,27 @@ def main():
         acc_benign = None
         acc_all = None
 
+        # 4) Periodic evaluation
         if current_round % eval_every == 0:
             print(f"[SERVER] Evaluating models at round {current_round}")
 
             if benign_models:
                 benign_avg = average_models(benign_models)
-                _, acc_benign = evaluate_vector_on_test(benign_avg, max_samples=1000)
+                _, acc_benign = evaluate_vector_on_test(
+                    benign_avg, max_samples=1000
+                )
 
             all_avg = average_models(all_models)
-            _, acc_all = evaluate_vector_on_test(all_avg, max_samples=1000)
+            _, acc_all = evaluate_vector_on_test(
+                all_avg, max_samples=1000
+            )
 
             print(f"[SERVER] Accuracy only with benigns: {acc_benign}")
             print(f"[SERVER] Accuracy with benigns + malicious: {acc_all}")
         else:
             print("[SERVER] Skipping evaluation this round")
 
-        #Log to CSV
+        # Log round metrics
         csv_writer.writerow([
             current_round,
             len(benign),
@@ -279,26 +329,22 @@ def main():
         ])
         log_file.flush()
 
-        # 4) Calculate real model
+        # 5) Compute new global model
         if benign:
-            benign_models = [received_models[a] for a in benign]
             benign_avg = average_models(benign_models)
-
             alpha = 0.3
             global_real_model = [
                 (1 - alpha) * old + alpha * new
                 for old, new in zip(global_real_model, benign_avg)
             ]
         else:
-            # Extreme case: Every agent is malicious
+            # Extreme case: all agents are malicious
             print("[SERVER] Every agent is malicious, using every agent value...")
-            global_real_model = average_models(
-                list(received_models.values())
-            )
+            global_real_model = average_models(all_models)
 
         print(f"[SERVER] New REAL model: {preview(global_real_model)}")
 
-        # 5) Notify honeypot the real model
+        # 6) Send global model to honeypot
         msg_real = {
             "round": current_round,
             "weights": global_real_model,
@@ -307,10 +353,9 @@ def main():
         producer.flush()
         print("[SERVER] -> Real model sent to honeypot")
 
-        # 6) If there are malicious agents, send them to the honeypot and wait
+        # 7) Send malicious agents to honeypot and receive corrected models
         hp_models = {}
         if malicious:
-            # Send malicious agents to honeypot
             for mal in malicious:
                 msg_mal = {
                     "round": current_round,
@@ -321,7 +366,6 @@ def main():
                 print(f"[SERVER] -> Malicious agent sent to Honeypot ({mal})")
             producer.flush()
 
-            # Wait for honeypot responses
             pending_hp = set(malicious)
             print("[SERVER] Waiting Honeypot models...")
             while pending_hp:
@@ -340,7 +384,7 @@ def main():
                 pending_hp.remove(agent_hp)
                 print(f"[SERVER] <- Honeypot model received for {agent_hp}")
 
-        # 7) Update the models to be seen for the agents
+        # 8) Update per-agent models for next round
         for a in agents:
             if a in malicious and a in hp_models:
                 per_agent_model[a] = hp_models[a]
@@ -351,7 +395,7 @@ def main():
         for a in agents:
             print(f"   {a}: {preview(per_agent_model[a])}")
 
-        # Pause
+        # Optional sleep between rounds
         if sleep_s > 0:
             time.sleep(sleep_s)
 
